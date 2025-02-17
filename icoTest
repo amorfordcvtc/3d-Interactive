@@ -1,0 +1,320 @@
+from direct.showbase.ShowBase import ShowBase
+from panda3d.core import (
+    GeomVertexFormat, GeomVertexData, GeomVertexWriter,
+    GeomTriangles, GeomLines, Geom, GeomNode, Vec3, Vec2,
+    CollisionNode, CollisionSphere, CollisionTraverser,
+    CollisionHandlerQueue, CollisionRay, BitMask32, RenderState
+)
+from direct.task import Task
+import math
+
+class DieApp(ShowBase):
+    def __init__(self):
+        ShowBase.__init__(self)
+        self.disableMouse()  # We control the camera manually.
+
+        # --- Set Up a Fixed Camera (the view) ---
+        # The camera remains fixed. Its view is your window.
+        # Place it at the origin, looking along the positive Y-axis.
+        camera.setPos(0, 0, 0)
+        camera.lookAt(0, 1, 0)
+
+        # --- Orbit Parameters for the Die ---
+        # The die will orbit around the camera.
+        self.orbit_radius = 10.0  # Distance from the camera.
+        self.orbit_angle = 0.0    # Azimuth angle (in radians). 0 means directly in front.
+        self.orbit_elevation = 0.0  # Elevation angle (in radians). 0 means on the horizontal plane.
+        
+        # --- Create the Die ---
+        self.die = self.create_icosahedron()
+        self.die.reparentTo(render)
+        self.update_die_position_from_orbit()
+        # Tag the die so that our collision picking can detect it.
+        self.die.setTag('die', 'true')
+        
+        # --- Create and Attach Colored Edges ---
+        # The edge geometry is built from the same vertex data as the die.
+        self.edges = self.create_edges()
+        # Parent the edges to the die so that they share its transformations.
+        self.edges.reparentTo(self.die)
+        # Optionally, set the line thickness (requires a suitable driver).
+        self.edges.setRenderModeThickness(2)
+
+        # --- Add a Collision Solid to the Die (for picking) ---
+        cs = CollisionSphere(0, 0, 0, 1.0)
+        cnode = CollisionNode('die_collision')
+        cnode.addSolid(cs)
+        cnode.setIntoCollideMask(BitMask32.bit(1))
+        self.die.attachNewNode(cnode)
+
+        # --- Set Up a Collision Ray for Mouse Picking ---
+        self.picker = CollisionTraverser()
+        self.pq = CollisionHandlerQueue()
+        self.picker_node = CollisionNode('mouseRay')
+        self.picker_node.setFromCollideMask(BitMask32.bit(1))
+        # Attach the ray to the camera (our fixed view)
+        self.picker_np = camera.attachNewNode(self.picker_node)
+        self.picker_ray = CollisionRay()
+        self.picker_node.addSolid(self.picker_ray)
+        self.picker.addCollider(self.picker_np, self.pq)
+
+        # --- Interaction State Variables ---
+        self.dragging = False
+        # The current mode is determined on mouse down:
+        #   'die_spin' if clicking on the die, or 'orbit' otherwise.
+        self.drag_mode = None
+        # For momentum, we record the last measured velocity.
+        self.die_spin_velocity = Vec2(0, 0)    # (horizontal, vertical) in degrees/second.
+        self.orbit_velocity = Vec2(0, 0)         # (azimuth, elevation) in radians/second.
+        self.momentum_mode = None
+
+        self.last_mouse_pos = None
+
+        # Sensitivity factors:
+        self.spin_sensitivity = 100.0   # degrees per mouse unit.
+        self.orbit_sensitivity = 3.0    # radians per mouse unit.
+        self.elev_sensitivity = 0.5     # radians per mouse unit.
+
+        # Friction factors (applied each frame when momentum is active).
+        self.spin_friction = 0.95
+        self.orbit_friction = 0.95
+
+        # --- Bind Mouse Events ---
+        self.accept('mouse1', self.on_mouse_down)
+        self.accept('mouse1-up', self.on_mouse_up)
+
+        # --- Task to Handle Mouse Movement and Inertia ---
+        self.taskMgr.add(self.mouse_task, "MouseTask")
+
+    def create_icosahedron(self):
+        """
+        Creates an icosahedron (die) using Panda3D's Geom API.
+        Uses 12 vertices and 20 triangular faces.
+        """
+        fmt = GeomVertexFormat.getV3()
+        vdata = GeomVertexData('icosahedron', fmt, Geom.UHStatic)
+        writer = GeomVertexWriter(vdata, 'vertex')
+
+        # Golden ratio and scale.
+        phi = (1 + math.sqrt(5)) / 2
+        scale_factor = 0.5
+        raw_vertices = [
+            (-1,  phi,  0),
+            ( 1,  phi,  0),
+            (-1, -phi,  0),
+            ( 1, -phi,  0),
+            ( 0, -1,  phi),
+            ( 0,  1,  phi),
+            ( 0, -1, -phi),
+            ( 0,  1, -phi),
+            ( phi,  0, -1),
+            ( phi,  0,  1),
+            (-phi,  0, -1),
+            (-phi,  0,  1)
+        ]
+        vertices = [Vec3(x, y, z) * scale_factor for (x, y, z) in raw_vertices]
+        for v in vertices:
+            writer.addData3f(v)
+
+        faces = [
+            (0, 11, 5),
+            (0, 5, 1),
+            (0, 1, 7),
+            (0, 7, 10),
+            (0, 10, 11),
+            (1, 5, 9),
+            (5, 11, 4),
+            (11, 10, 2),
+            (10, 7, 6),
+            (7, 1, 8),
+            (3, 9, 4),
+            (3, 4, 2),
+            (3, 2, 6),
+            (3, 6, 8),
+            (3, 8, 9),
+            (4, 9, 5),
+            (2, 4, 11),
+            (6, 2, 10),
+            (8, 6, 7),
+            (9, 8, 1)
+        ]
+
+        triangles = GeomTriangles(Geom.UHStatic)
+        for face in faces:
+            triangles.addVertices(*face)
+            triangles.closePrimitive()
+
+        geom = Geom(vdata)
+        geom.addPrimitive(triangles)
+        node = GeomNode('icosahedron')
+        node.addGeom(geom)
+        return render.attachNewNode(node)
+
+    def create_edges(self):
+        """
+        Creates line geometry for the die's edges.
+        Uses the same vertices and face definitions as the die geometry.
+        Each edge is drawn in a constant color (red in this example).
+        """
+        # Recreate the vertex positions.
+        phi = (1 + math.sqrt(5)) / 2
+        scale_factor = 0.5
+        raw_vertices = [
+            (-1,  phi,  0),
+            ( 1,  phi,  0),
+            (-1, -phi,  0),
+            ( 1, -phi,  0),
+            ( 0, -1,  phi),
+            ( 0,  1,  phi),
+            ( 0, -1, -phi),
+            ( 0,  1, -phi),
+            ( phi,  0, -1),
+            ( phi,  0,  1),
+            (-phi,  0, -1),
+            (-phi,  0,  1)
+        ]
+        vertices = [Vec3(x, y, z) * scale_factor for (x, y, z) in raw_vertices]
+
+        # Define the faces.
+        faces = [
+            (0, 11, 5),
+            (0, 5, 1),
+            (0, 1, 7),
+            (0, 7, 10),
+            (0, 10, 11),
+            (1, 5, 9),
+            (5, 11, 4),
+            (11, 10, 2),
+            (10, 7, 6),
+            (7, 1, 8),
+            (3, 9, 4),
+            (3, 4, 2),
+            (3, 2, 6),
+            (3, 6, 8),
+            (3, 8, 9),
+            (4, 9, 5),
+            (2, 4, 11),
+            (6, 2, 10),
+            (8, 6, 7),
+            (9, 8, 1)
+        ]
+
+        # Compute unique edges.
+        edges_set = set()
+        for f in faces:
+            a, b, c = f
+            for edge in [(a, b), (b, c), (c, a)]:
+                # Store each edge as a sorted tuple so each edge appears once.
+                edges_set.add(tuple(sorted(edge)))
+        edges = list(edges_set)
+
+        # Create vertex data with both vertex and color.
+        fmt = GeomVertexFormat.getV3c4()
+        vdata = GeomVertexData('edges', fmt, Geom.UHStatic)
+        writer = GeomVertexWriter(vdata, 'vertex')
+        color_writer = GeomVertexWriter(vdata, 'color')
+        for v in vertices:
+            writer.addData3f(v)
+            # Set each vertex color to red (R,G,B,A).
+            color_writer.addData4f(1.0, 0.0, 0.0, 1.0)
+
+        # Create a lines primitive and add each edge.
+        lines = GeomLines(Geom.UHStatic)
+        for edge in edges:
+            i, j = edge
+            lines.addVertices(i, j)
+            lines.closePrimitive()
+
+        geom = Geom(vdata)
+        geom.addPrimitive(lines)
+        node = GeomNode('edges')
+        node.addGeom(geom)
+        return render.attachNewNode(node)
+
+    def update_die_position_from_orbit(self):
+        """
+        Computes the die's position from spherical coordinates relative to the camera (at the origin).
+        Uses self.orbit_radius, self.orbit_angle (azimuth) and self.orbit_elevation.
+        """
+        r = self.orbit_radius
+        a = self.orbit_angle
+        e = self.orbit_elevation
+        new_x = r * math.cos(e) * math.sin(a)
+        new_y = r * math.cos(e) * math.cos(a)
+        new_z = r * math.sin(e)
+        self.die.setPos(new_x, new_y, new_z)
+
+    def on_mouse_down(self):
+        """When the mouse button is pressed, start dragging and reset momentum."""
+        self.dragging = True
+        self.momentum_mode = None
+        if self.mouseWatcherNode.hasMouse():
+            self.last_mouse_pos = Vec2(self.mouseWatcherNode.getMouse())
+            # Set up the picking ray.
+            mpos = self.last_mouse_pos
+            self.picker_ray.setFromLens(self.camNode, mpos.x, mpos.y)
+            self.picker.traverse(render)
+            if self.pq.getNumEntries() > 0:
+                self.pq.sortEntries()
+                entry = self.pq.getEntry(0)
+                picked_np = entry.getIntoNodePath()
+                if picked_np.getNetTag('die') == 'true':
+                    self.drag_mode = 'die_spin'
+                else:
+                    self.drag_mode = 'orbit'
+            else:
+                self.drag_mode = 'orbit'
+        # Reset momentum velocities.
+        self.die_spin_velocity = Vec2(0, 0)
+        self.orbit_velocity = Vec2(0, 0)
+
+    def on_mouse_up(self):
+        """When the mouse button is released, stop dragging and store the last mode for momentum."""
+        self.dragging = False
+        self.momentum_mode = self.drag_mode
+        self.last_mouse_pos = None
+
+    def mouse_task(self, task):
+        """Handles mouse movement and applies momentum when not dragging."""
+        dt = globalClock.getDt()
+        if self.dragging and self.mouseWatcherNode.hasMouse():
+            current_mouse_pos = Vec2(self.mouseWatcherNode.getMouse())
+            if self.last_mouse_pos is not None:
+                delta = current_mouse_pos - self.last_mouse_pos
+                if self.drag_mode == 'die_spin':
+                    rotation_inc = Vec2(delta.x * self.spin_sensitivity, -delta.y * self.spin_sensitivity)
+                    current_hpr = self.die.getHpr()
+                    self.die.setHpr(current_hpr.x + rotation_inc.x, current_hpr.y + rotation_inc.y, current_hpr.z)
+                    self.die_spin_velocity = rotation_inc / dt
+                elif self.drag_mode == 'orbit':
+                    self.orbit_angle += delta.x * self.orbit_sensitivity
+                    self.orbit_elevation += delta.y * self.elev_sensitivity
+                    self.orbit_elevation = max(-math.pi/2 + 0.1, min(math.pi/2 - 0.1, self.orbit_elevation))
+                    self.orbit_velocity = Vec2(delta.x * self.orbit_sensitivity, delta.y * self.elev_sensitivity) / dt
+                    self.update_die_position_from_orbit()
+            self.last_mouse_pos = current_mouse_pos
+        else:
+            # Apply momentum when not dragging.
+            if self.momentum_mode == 'die_spin':
+                rotation_inc = self.die_spin_velocity * dt
+                current_hpr = self.die.getHpr()
+                self.die.setHpr(current_hpr.x + rotation_inc.x, current_hpr.y + rotation_inc.y, current_hpr.z)
+                self.die_spin_velocity *= self.spin_friction
+                if self.die_spin_velocity.length() < 0.1:
+                    self.die_spin_velocity = Vec2(0, 0)
+                    self.momentum_mode = None
+            elif self.momentum_mode == 'orbit':
+                self.orbit_angle += self.orbit_velocity.x * dt
+                self.orbit_elevation += self.orbit_velocity.y * dt
+                self.orbit_elevation = max(-math.pi/2 + 0.1, min(math.pi/2 - 0.1, self.orbit_elevation))
+                self.update_die_position_from_orbit()
+                self.orbit_velocity *= self.orbit_friction
+                if self.orbit_velocity.length() < 0.001:
+                    self.orbit_velocity = Vec2(0, 0)
+                    self.momentum_mode = None
+
+        return Task.cont
+
+# Create and run the application.
+app = DieApp()
+app.run()
